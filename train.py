@@ -1,6 +1,5 @@
 import os
-# Set this before importing TensorFlow to suppress CUDA/XLA INFO logs
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 0=all, 1=INFO off, 2=INFO+WARNING off, 3=ERROR only
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
 import json
 import time
 import logging
@@ -12,10 +11,9 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 from sklearn.model_selection import KFold, train_test_split
 from tensorflow.keras import layers, Model
 
-# Suppress remaining TensorFlow logs
 tf.get_logger().setLevel(logging.ERROR)
 
-# Use GPU if available
+# Configure GPU memory growth
 gpus = tf.config.experimental.list_physical_devices('GPU')
 if gpus:
     try:
@@ -53,25 +51,17 @@ class ConvLSTM(Model):
     def call(self, inputs, training=False):
         y = inputs
         pad_size = self.conv_kernel_size - 1
-        
-        # Left padding with replication
-        left_pad = tf.repeat(y[:, :1, :], pad_size, axis=1)
-        y = tf.concat([left_pad, y], axis=1)
-        
-        y = self.conv1(y)
+        left_pad = tf.repeat(y[:, :1, :], pad_size, axis=1)  # Replicate first timestep
+        y = tf.concat([left_pad, y], axis=1)  # (batch, seq_len + pad_size, feats)
+        y = self.conv1(y)  # (batch, seq_len, embedding_size)
         y = self.relu1(y)
-        
-        # Right padding to maintain seq_len after pooling
-        right_pad = tf.repeat(y[:, -1:, :], 1, axis=1)
-        y = tf.concat([y, right_pad], axis=1)
-        y = self.pool(y)
-        
+        y = self.pool(y)   # (batch, seq_len - 1, embedding_size)
         if self.cell_norm:
             y = self.cell_ln(y)
         y = self.lstm(y, training=training)
         if self.out_norm:
             y = self.ln(y)
-        y = self.o_proj(y)
+        y = self.o_proj(y)  # (batch, seq_len - 1, 1)
         return y
 
 def create_loader(data, batch_size, shuffle=False):
@@ -97,8 +87,7 @@ def get_pumps(data, segment_length, pad=True):
             continue
         pump_i['delta_minutes'] = (pump_i['date'] - pump_i['date'].shift(1)).fillna(PLACEHOLDER_TIMEDELTA)
         pump_i['delta_minutes'] = pump_i['delta_minutes'].apply(lambda x: x.total_seconds() / 60)
-        pump_i = pump_i[FEATURE_NAMES + ['gt']]
-        pump_i = pump_i.values.astype(np.float32)
+        pump_i = pump_i[FEATURE_NAMES + ['gt']].values.astype(np.float32)
         if pad:
             pump_i = np.pad(pump_i, ((segment_length - 1, 0), (0, 0)), mode='reflect')
         pumps.append(pump_i)
@@ -112,14 +101,14 @@ def process_data(data, segment_length=15):
     pumps = get_pumps(data, segment_length)
     segments = []
     for pump in pumps:
-        for i, window in enumerate(np.lib.stride_tricks.sliding_window_view(pump, segment_length, axis=0)):
-            segment = window.transpose()
+        for window in np.lib.stride_tricks.sliding_window_view(pump, segment_length, axis=0):
+            segment = window.transpose()  # (feats, seq_len)
             segments.append(segment)
     print(f'{len(segments)} rows of data after processing')
-    return np.stack(segments)
+    return np.stack(segments)  # (num_samples, feats, seq_len)
 
 def undersample_data(data, undersample_ratio):
-    with_anomalies = data[:, :, -1].sum(axis=1) > 0
+    with_anomalies = data[:, :, -1].sum(axis=1) > 0  # Check for any positive labels
     mask = with_anomalies | (np.random.rand(data.shape[0]) < undersample_ratio)
     return data[mask]
 
@@ -145,17 +134,17 @@ def train(model, dataloader, optimizer, criterion, feature_count=13):
     while True:
         try:
             batch = next(iterator)
-            x = batch[:, :, :feature_count]
-            y = batch[:, :, -1]  # Full sequence target
+            x = batch[:, :, :feature_count]  # Features
+            y = batch[:, :, -1]  # Ground truth
             with tf.GradientTape() as tape:
-                preds = model(x, training=True)[:, :, 0]
-                loss = criterion(y, preds)
+                preds = model(x, training=True)[:, :, 0]  # (batch, seq_len - 1)
+                loss = criterion(y[:, 1:], preds)  # Align with output length
             gradients = tape.gradient(loss, model.trainable_variables)
             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
             epoch_loss += loss.numpy()
             num_batches += 1
         except StopIteration:
-            break  # Exit when dataset is exhausted
+            break
     return epoch_loss / num_batches if num_batches > 0 else 0
 
 def validate(model, dataloader, verbose=True, pr_threshold=0.7, feature_count=13):
@@ -168,8 +157,8 @@ def validate(model, dataloader, verbose=True, pr_threshold=0.7, feature_count=13
         try:
             batch = next(iterator)
             x = batch[:, :, :feature_count]
-            y = batch[:, -1, -1]
-            preds = model(x, training=False)[:, -1, 0]
+            y = batch[:, -1, -1]  # Last timestep label
+            preds = model(x, training=False)[:, -1, 0]  # Last timestep prediction
             if verbose:
                 preds_0.extend(preds[y == 0].numpy())
                 preds_1.extend(preds[y == 1].numpy())
@@ -205,13 +194,24 @@ def pick_threshold(model, dataloader, undersample_ratio, feature_count=13):
     y = np.concatenate(all_ys, axis=0)
     preds = np.concatenate(all_preds, axis=0)
     precision, recall, thresholds = precision_recall_curve(y, preds)
-    f1_scores = 2 * recall * precision / (recall + precision + 1e-10)
-    best_threshold = thresholds[np.argmax(f1_scores)]
-    print(f'Best threshold: {best_threshold} (train f1: {np.max(f1_scores):0.5f})')
+    best_f1 = 0
+    best_threshold = 0
+    for threshold in thresholds:
+        true_pos = np.sum(preds[y == 1] >= threshold)
+        false_pos = np.sum(preds[y == 0] >= threshold) / undersample_ratio
+        false_neg = np.sum(preds[y == 1] < threshold)
+        true_neg = np.sum(preds[y == 0] < threshold) / undersample_ratio
+        precision = true_pos / (true_pos + false_pos + 1e-10)
+        recall = true_pos / (true_pos + false_neg + 1e-10)
+        f1 = 2 * precision * recall / (precision + recall + 1e-10)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold
+    print(f'Best threshold: {best_threshold} (train f1: {best_f1:0.5f})')
     return best_threshold
 
 def collect_metrics_n_epochs(model, train_loader, test_loader, optimizer, criterion, config, feature_count=13):
-    best_metrics = np.array([0.0]*4)
+    best_metrics = np.array([0.0]*4)  # [acc, precision, recall, f1]
     for epoch in range(config.n_epochs):
         start = time.time()
         loss = train(model, train_loader, optimizer, criterion, feature_count)
@@ -242,16 +242,17 @@ class Config:
 def main():
     with open('conv_lstm_config.json', 'r') as f:
         configs = json.load(f)
-    config_name = "15S_optimal_5Folds"
+    config_name = "15S_optimal_5Folds"  # Adjust as needed
     config = Config(configs[config_name])
     
+    # Set seeds for reproducibility
     tf.random.set_seed(config.seed)
     np.random.seed(config.seed)
     random.seed(config.seed)
     
     data_path = os.path.join('data', os.path.basename(config.dataset))
     train_data, test_data = get_data(data_path, config.batch_size, 0.8, config.undersample_ratio, config.segment_length)
-    feature_count = train_data.shape[-1] - 1
+    feature_count = train_data.shape[-1] - 1  # Exclude ground truth
     
     train_loader = create_loader(train_data, config.batch_size, shuffle=True)
     test_loader = create_loader(test_data, config.batch_size)
@@ -269,7 +270,7 @@ def main():
     optimizer = tf.keras.optimizers.Adam(learning_rate=config.lr)
     criterion = tf.keras.losses.BinaryCrossentropy()
     
-    fold_metrics = np.array([0.0]*4)
+    fold_metrics = np.array([0.0]*4)  # Aggregate across folds
     if config.kfolds > 1:
         kf = KFold(n_splits=config.kfolds, shuffle=True, random_state=config.seed)
         for fold_i, (train_idx, test_idx) in enumerate(kf.split(train_data)):
